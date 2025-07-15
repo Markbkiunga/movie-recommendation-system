@@ -6,6 +6,8 @@ import numpy as np
 from sklearn.decomposition import TruncatedSVD
 
 # Add the project root directory to Python's path
+# This helps resolve imports like 'src.recommendation_models' when running from app/
+# (though running from root 'movie-recommendation-system/' is still recommended)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.recommendation_models import user_based_recommendations, fit_svd_model, svd_recommendations, content_based_recommendations_genre, hybrid_content_recommendations
@@ -16,14 +18,24 @@ from src.recommendation_models import user_based_recommendations, fit_svd_model,
 def load_data():
     """Loads all necessary processed dataframes."""
     try:
-        ratings = pd.read_csv('data/processed/ratings_clean.csv')
-        movies = pd.read_csv('data/processed/movies_clean.csv')
+        # Explicitly set dtype for movieId upon reading CSVs
+        ratings = pd.read_csv('data/processed/ratings_clean.csv', dtype={'movieId': int})
+        movies = pd.read_csv('data/processed/movies_clean.csv', dtype={'movieId': int})
         user_movie_matrix = pd.read_csv('data/processed/user_movie_matrix.csv', index_col=0)
-        movies_with_features = pd.read_csv('data/processed/movies_with_features.csv')
+        movies_with_features = pd.read_csv('data/processed/movies_with_features.csv', dtype={'movieId': int})
         
-        # Ensure movieId is a column in user_movie_matrix for merging later
-        if user_movie_matrix.columns.name == 'movieId':
-            user_movie_matrix.columns = user_movie_matrix.columns.astype(int) # Ensure movie IDs are integers
+        # Ensure movieId is integer type across all relevant dataframes loaded here
+        # The dtype parameter above should handle this, but these are extra safeguards.
+        ratings['movieId'] = pd.to_numeric(ratings['movieId'], errors='coerce').fillna(0).astype(int)
+        movies['movieId'] = pd.to_numeric(movies['movieId'], errors='coerce').fillna(0).astype(int)
+        movies_with_features['movieId'] = pd.to_numeric(movies_with_features['movieId'], errors='coerce').fillna(0).astype(int)
+        
+        # Ensure user_movie_matrix columns (movieIds) are integers
+        # This is important because user_movie_matrix.columns are movieIds
+        if user_movie_matrix.columns.name == 'movieId': # Check if the column name is movieId
+            user_movie_matrix.columns = pd.to_numeric(user_movie_matrix.columns, errors='coerce').fillna(0).astype(int)
+        else: # If movieId is not the column name, assume it's just the index and convert
+            user_movie_matrix.columns = user_movie_matrix.columns.astype(int)
         
         # Fit SVD model once on load
         fit_svd_model(user_movie_matrix) # This will set global svd_model and user_movie_matrix_reduced
@@ -79,17 +91,27 @@ if st.button("Get Recommendations"):
             recommendations = hybrid_content_recommendations(selected_user, movies_with_features, ratings, num_recs)
         
         if not recommendations.empty and len(recommendations) > 0:
-            # Get movie details for recommendations
-            # Ensure movieIds are correctly aligned for merging
-            rec_movie_ids = recommendations.index.astype(int) # Convert index to int for merging
+            # Ensure recommendations index is integer for filtering and merging
+            recommendations.index = pd.to_numeric(recommendations.index, errors='coerce').fillna(0).astype(int)
             
             # Filter movies_with_features for the recommended movie IDs
-            rec_movies_details = movies_with_features[movies_with_features['movieId'].isin(rec_movie_ids)].copy()
+            # Ensure movies_with_features['movieId'] is int here (redundant but safe after load_data fix)
+            movies_with_features['movieId'] = pd.to_numeric(movies_with_features['movieId'], errors='coerce').fillna(0).astype(int)
+            rec_movies_details = movies_with_features[movies_with_features['movieId'].isin(recommendations.index)].copy()
             
+            # Prepare recommendations for merge
+            rec_df_to_merge = recommendations.reset_index().rename(columns={'index': 'movieId', 0: 'rec_score'})
+            # Crucial cast for the right side of merge, ensuring it's integer
+            rec_df_to_merge['movieId'] = pd.to_numeric(rec_df_to_merge['movieId'], errors='coerce').fillna(0).astype(int) 
+
+            # --- DEBUG PRINTS ---
+            st.write(f"DEBUG: Type of rec_movies_details['movieId']: {rec_movies_details['movieId'].dtype}")
+            st.write(f"DEBUG: Type of rec_df_to_merge['movieId']: {rec_df_to_merge['movieId'].dtype}")
+            # --- END DEBUG PRINTS ---
+
             # Merge with recommendation scores
-            # Reset index of recommendations to merge on movie ID
             rec_movies_details = rec_movies_details.merge(
-                recommendations.reset_index().rename(columns={'index': 'movieId', 0: 'rec_score'}),
+                rec_df_to_merge,
                 on='movieId',
                 how='left'
             )
@@ -105,12 +127,13 @@ if st.button("Get Recommendations"):
                     col1, col2 = st.columns([3, 1])
                     
                     with col1:
-                        st.markdown(f"**{idx+1}. {movie['title']}**") # Use idx+1 for display numbering
+                        # Use movie.name for consistent numbering if iterrows is used with default index
+                        st.markdown(f"**{idx+1}. {movie['title']}**") 
                         st.markdown(f"*Genres:* {movie['genres']}")
                         if 'avg_rating' in movie:
                             st.markdown(f"*Average Rating:* {movie['avg_rating']:.1f} ⭐")
                         if 'num_ratings' in movie:
-                            st.markdown(f"*Number of Ratings:* {int(movie['num_ratings'])}") # Display as integer
+                            st.markdown(f"*Number of Ratings:* {int(movie['num_ratings'])}")
                     
                     with col2:
                         st.metric("Recommendation Score", f"{movie['rec_score']:.3f}")
@@ -144,3 +167,4 @@ st.sidebar.subheader("Dataset Statistics")
 st.sidebar.write(f"Total Users: {ratings['userId'].nunique()}")
 st.sidebar.write(f"Total Movies: {movies['movieId'].nunique()}")
 st.sidebar.write(f"Total Ratings (Cleaned): {len(ratings)}")
+

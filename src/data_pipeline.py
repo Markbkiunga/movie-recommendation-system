@@ -1,170 +1,167 @@
+import os
+import sys
+import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from datetime import datetime
-from sklearn.preprocessing import MultiLabelBinarizer
-from sklearn.model_selection import train_test_split
+from sklearn.decomposition import TruncatedSVD
 
-print("--- Starting Data Preprocessing and Feature Engineering ---")
+# Add the project root directory to Python's path
+# This helps resolve imports like 'src.recommendation_models' when running from app/
+# (though running from root 'movie-recommendation-system/' is still recommended)
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# --- 1. Data Loading (Week 1) ---
-print("\n1. Loading raw datasets...")
-ratings = pd.read_csv('data/raw/ratings.csv')
-movies = pd.read_csv('data/raw/movies.csv')
+from src.recommendation_models import user_based_recommendations, fit_svd_model, svd_recommendations, content_based_recommendations_genre, hybrid_content_recommendations
 
-print("Ratings dataset shape:", ratings.shape)
-print("Movies dataset shape:", movies.shape)
+# --- Load Data ---
+# Use Streamlit's caching to load data only once
+@st.cache_data
+def load_data():
+    """Loads all necessary processed dataframes."""
+    try:
+        ratings = pd.read_csv('data/processed/ratings_clean.csv')
+        movies = pd.read_csv('data/processed/movies_clean.csv')
+        user_movie_matrix = pd.read_csv('data/processed/user_movie_matrix.csv', index_col=0)
+        movies_with_features = pd.read_csv('data/processed/movies_with_features.csv')
+        
+        # Ensure movieId is integer type across all relevant dataframes loaded here
+        # Use errors='coerce' to turn unparseable values into NaN, then fill and convert
+        # This is a safeguard, though ideally data_pipeline ensures clean ints
+        ratings['movieId'] = pd.to_numeric(ratings['movieId'], errors='coerce').fillna(0).astype(int)
+        movies['movieId'] = pd.to_numeric(movies['movieId'], errors='coerce').fillna(0).astype(int)
+        movies_with_features['movieId'] = pd.to_numeric(movies_with_features['movieId'], errors='coerce').fillna(0).astype(int)
+        
+        # Ensure user_movie_matrix columns (movieIds) are integers
+        if user_movie_matrix.columns.name == 'movieId':
+            user_movie_matrix.columns = pd.to_numeric(user_movie_matrix.columns, errors='coerce').fillna(0).astype(int)
+        
+        # Fit SVD model once on load
+        fit_svd_model(user_movie_matrix) # This will set global svd_model and user_movie_matrix_reduced
+        
+        return ratings, movies, user_movie_matrix, movies_with_features
+    except FileNotFoundError as e:
+        st.error(f"Error loading data: {e}. Make sure you have run src/data_pipeline.py to process the data.")
+        st.stop() # Stop the app if data files are missing
+    except Exception as e:
+        st.error(f"An unexpected error occurred during data loading: {e}")
+        st.stop()
 
-# --- 2. Data Exploration and Cleaning (Week 2) ---
-print("\n2. Performing Data Cleaning Tasks...")
+ratings, movies, user_movie_matrix, movies_with_features = load_data()
 
-# Check for missing values
-print("Missing values in ratings:\n", ratings.isnull().sum())
-print("\nMissing values in movies:\n", movies.isnull().sum())
+st.title("🎬 Movie Recommendation System")
+st.markdown("Get personalized movie recommendations based on your preferences!")
 
-# Check for duplicates
-print(f"\nDuplicate ratings: {ratings.duplicated().sum()}")
-if ratings.duplicated().sum() > 0:
-    ratings.drop_duplicates(inplace=True)
-    print("Duplicate ratings removed.")
+# --- Sidebar for User Input ---
+st.sidebar.header("Recommendation Settings")
 
-# Remove users with less than 5 ratings
-user_counts = ratings['userId'].value_counts()
-active_users = user_counts[user_counts >= 5].index
-ratings_filtered = ratings[ratings['userId'].isin(active_users)].copy() # Use .copy() to avoid SettingWithCopyWarning
-print(f"Users after filtering (>=5 ratings): {ratings_filtered['userId'].nunique()}")
+# User selection
+user_ids = sorted(ratings['userId'].unique())
+selected_user = st.sidebar.selectbox("Select User ID:", user_ids)
 
-# Remove movies with less than 5 ratings
-movie_counts = ratings_filtered['movieId'].value_counts()
-popular_movies = movie_counts[movie_counts >= 5].index
-ratings_filtered = ratings_filtered[ratings_filtered['movieId'].isin(popular_movies)].copy() # Use .copy()
-print(f"Movies after filtering (>=5 ratings): {ratings_filtered['movieId'].nunique()}")
+# Number of recommendations
+num_recs = st.sidebar.slider("Number of recommendations:", 1, 20, 10)
 
-# Keep only movies that exist in both datasets after filtering
-common_movies_ids = set(ratings_filtered['movieId']) & set(movies['movieId'])
-ratings_clean = ratings_filtered[ratings_filtered['movieId'].isin(common_movies_ids)].copy()
-movies_clean = movies[movies['movieId'].isin(common_movies_ids)].copy()
-
-print(f"\nFinal cleaned dataset sizes:")
-print(f"Clean ratings: {len(ratings_clean)}")
-print(f"Clean movies: {len(movies_clean)}")
-print(f"Users: {ratings_clean['userId'].nunique()}")
-print(f"Movies: {ratings_clean['movieId'].nunique()}")
-
-# Convert timestamp to datetime for temporal analysis (if needed later, though not explicitly used in final app)
-if 'timestamp' in ratings_clean.columns:
-    ratings_clean['datetime'] = pd.to_datetime(ratings_clean['timestamp'], unit='s')
-    ratings_clean['year'] = ratings_clean['datetime'].dt.year
-    ratings_clean['month'] = ratings_clean['datetime'].dt.month
-
-# Save cleaned data
-ratings_clean.to_csv('data/processed/ratings_clean.csv', index=False)
-movies_clean.to_csv('data/processed/movies_clean.csv', index=False)
-print("Cleaned data saved to data/processed/")
-
-# --- 3. Feature Engineering (Week 3) ---
-print("\n3. Performing Feature Engineering...")
-
-# Create user-movie rating matrix (for Collaborative Filtering)
-user_movie_matrix = ratings_clean.pivot_table(
-    index='userId',
-    columns='movieId',
-    values='rating',
-    fill_value=0
-)
-print(f"User-movie matrix shape: {user_movie_matrix.shape}")
-
-# Genre processing (for Content-Based Filtering)
-movies_clean['genre_list'] = movies_clean['genres'].str.split('|')
-movies_clean['genre_list'] = movies_clean['genre_list'].fillna('Unknown').apply(
-    lambda x: ['Unknown'] if x == 'Unknown' else x
+# Model selection
+model_type = st.sidebar.selectbox(
+    "Choose recommendation method:",
+    ["User-Based Collaborative Filtering", "SVD Matrix Factorization", "Content-Based Filtering", "Hybrid Approach"]
 )
 
-mlb = MultiLabelBinarizer()
-genre_encoded = mlb.fit_transform(movies_clean['genre_list'])
-genre_df = pd.DataFrame(genre_encoded, columns=mlb.classes_)
-movies_with_features = pd.concat([movies_clean.reset_index(drop=True), genre_df], axis=1)
+# Display user's rating history
+if st.sidebar.button("Show User's Rating History"):
+    user_ratings = ratings[ratings['userId'] == selected_user].merge(movies, on='movieId')
+    user_ratings = user_ratings.sort_values('rating', ascending=False)
+    st.subheader(f"User {selected_user}'s Rating History")
+    st.dataframe(user_ratings[['title', 'genres', 'rating']].head(10))
 
-print(f"Available genres: {list(mlb.classes_)}")
-print(f"Movies with genre features shape: {movies_with_features.shape}")
+# --- Main Recommendation Section ---
+if st.button("Get Recommendations"):
+    recommendations = pd.Series(dtype=float) # Initialize as empty Series
+    try:
+        if model_type == "User-Based Collaborative Filtering":
+            recommendations = user_based_recommendations(selected_user, user_movie_matrix, num_recs)
+        elif model_type == "SVD Matrix Factorization":
+            # SVD model is fitted during load_data, so we can directly call svd_recommendations
+            recommendations = svd_recommendations(selected_user, user_movie_matrix, num_recs)
+        elif model_type == "Content-Based Filtering":
+            recommendations = content_based_recommendations_genre(selected_user, movies_with_features, ratings, num_recs)
+        elif model_type == "Hybrid Approach":
+            recommendations = hybrid_content_recommendations(selected_user, movies_with_features, ratings, num_recs)
+        
+        if not recommendations.empty and len(recommendations) > 0:
+            # Ensure recommendations index is integer for filtering and merging
+            recommendations.index = pd.to_numeric(recommendations.index, errors='coerce').fillna(0).astype(int)
+            
+            # Filter movies_with_features for the recommended movie IDs
+            # Ensure movies_with_features['movieId'] is int here (redundant but safe after load_data fix)
+            movies_with_features['movieId'] = pd.to_numeric(movies_with_features['movieId'], errors='coerce').fillna(0).astype(int)
+            rec_movies_details = movies_with_features[movies_with_features['movieId'].isin(recommendations.index)].copy()
+            
+            # Prepare recommendations for merge
+            rec_df_to_merge = recommendations.reset_index().rename(columns={'index': 'movieId', 0: 'rec_score'})
+            # Crucial cast for the right side of merge, ensuring it's integer
+            rec_df_to_merge['movieId'] = pd.to_numeric(rec_df_to_merge['movieId'], errors='coerce').fillna(0).astype(int) 
 
-# User statistics (e.g., for user features in hybrid models)
-user_stats = ratings_clean.groupby('userId').agg({
-    'rating': ['count', 'mean', 'std'],
-    'movieId': 'nunique'
-}).round(2)
-user_stats.columns = ['num_ratings', 'avg_rating', 'rating_std', 'num_movies']
-user_stats['rating_std'] = user_stats['rating_std'].fillna(0) # Handle users with only one rating
+            # --- DEBUG PRINTS ---
+            st.write(f"DEBUG: Type of rec_movies_details['movieId']: {rec_movies_details['movieId'].dtype}")
+            st.write(f"DEBUG: Type of rec_df_to_merge['movieId']: {rec_df_to_merge['movieId'].dtype}")
+            # --- END DEBUG PRINTS ---
 
-# Movie statistics (e.g., for popularity in hybrid models)
-movie_stats = ratings_clean.groupby('movieId').agg({
-    'rating': ['count', 'mean', 'std'],
-    'userId': 'nunique'
-}).round(2)
-movie_stats.columns = ['num_ratings', 'avg_rating', 'rating_std', 'num_users']
-movie_stats['rating_std'] = movie_stats['rating_std'].fillna(0)
+            # Merge with recommendation scores
+            rec_movies_details = rec_movies_details.merge(
+                rec_df_to_merge,
+                on='movieId',
+                how='left'
+            )
+            
+            # Sort by recommendation score
+            rec_movies_details = rec_movies_details.sort_values('rec_score', ascending=False)
+            
+            st.subheader(f"Top {num_recs} Recommendations for User {selected_user}")
+            
+            # Display recommendations in a nice format
+            for idx, movie in rec_movies_details.iterrows():
+                with st.container():
+                    col1, col2 = st.columns([3, 1])
+                    
+                    with col1:
+                        # Use movie.name for consistent numbering if iterrows is used with default index
+                        st.markdown(f"**{idx+1}. {movie['title']}**") 
+                        st.markdown(f"*Genres:* {movie['genres']}")
+                        if 'avg_rating' in movie:
+                            st.markdown(f"*Average Rating:* {movie['avg_rating']:.1f} ⭐")
+                        if 'num_ratings' in movie:
+                            st.markdown(f"*Number of Ratings:* {int(movie['num_ratings'])}")
+                    
+                    with col2:
+                        st.metric("Recommendation Score", f"{movie['rec_score']:.3f}")
+                    
+                    st.markdown("---")
+        else:
+            st.warning("No recommendations found for this user with the selected method. Try a different user or method.")
+            
+    except Exception as e:
+        st.error(f"Error generating recommendations: {str(e)}")
+        st.exception(e) # Display full traceback for debugging
 
-# Merge movie stats with movie info
-movies_with_features = movies_with_features.merge(movie_stats[['num_ratings', 'avg_rating']], on='movieId', how='left')
+# --- Additional Features (Sidebar) ---
+st.sidebar.markdown("---")
+st.sidebar.subheader("Explore Movies")
 
+# Movie search
+search_term = st.sidebar.text_input("Search for a movie by title:")
+if search_term:
+    matching_movies = movies[movies['title'].str.contains(search_term, case=False, na=False)]
+    if not matching_movies.empty:
+        st.sidebar.write("Found movies (Top 5):")
+        for _, movie in matching_movies.head(5).iterrows():
+            st.sidebar.write(f"- {movie['title']} ({movie['genres']})")
+    else:
+        st.sidebar.write("No movies found matching your search.")
 
-# User genre preferences (if needed for specific content-based approaches)
-# This part of feature engineering is more complex and might be simplified for initial implementation
-# user_genre_prefs = ratings_clean.merge(movies_clean, on='movieId')
-# user_genre_matrix = pd.DataFrame()
-# for genre in mlb.classes_:
-#     genre_ratings = user_genre_prefs[user_genre_prefs['genres'].str.contains(genre, na=False)]
-#     if len(genre_ratings) > 0:
-#         genre_avg = genre_ratings.groupby('userId')['rating'].mean()
-#         user_genre_matrix[genre] = genre_avg
-# user_genre_matrix = user_genre_matrix.fillna(0)
-# print(f"User genre preferences matrix shape: {user_genre_matrix.shape}")
+# Statistics
+st.sidebar.markdown("---")
+st.sidebar.subheader("Dataset Statistics")
+st.sidebar.write(f"Total Users: {ratings['userId'].nunique()}")
+st.sidebar.write(f"Total Movies: {movies['movieId'].nunique()}")
+st.sidebar.write(f"Total Ratings (Cleaned): {len(ratings)}")
 
-
-# Save processed features
-user_movie_matrix.to_csv('data/processed/user_movie_matrix.csv')
-movies_with_features.to_csv('data/processed/movies_with_features.csv', index=False)
-user_stats.to_csv('data/processed/user_stats.csv')
-# user_genre_matrix.to_csv('data/processed/user_genre_preferences.csv') # Uncomment if you implement user_genre_matrix
-print("Feature engineered data saved to data/processed/")
-
-# --- Train/Test Split Strategy ---
-print("\n4. Performing Train/Test Split...")
-# Time-based split (more realistic for recommendations)
-# Sort by timestamp and split 80-20
-ratings_sorted = ratings_clean.sort_values('timestamp')
-split_index = int(len(ratings_sorted) * 0.8)
-train_ratings = ratings_sorted[:split_index].copy()
-test_ratings = ratings_sorted[split_index:].copy()
-
-print(f"Train set size: {len(train_ratings)}")
-print(f"Test set size: {len(test_ratings)}")
-
-# Create train and test matrices
-train_matrix = train_ratings.pivot_table(
-    index='userId', columns='movieId', values='rating', fill_value=0
-)
-test_matrix = test_ratings.pivot_table(
-    index='userId', columns='movieId', values='rating', fill_value=0
-)
-
-# Ensure same dimensions and common users/movies for evaluation consistency
-# This step is crucial for evaluation later if you want to compare predictions on test_matrix
-common_users_split = list(set(train_matrix.index) & set(test_matrix.index))
-common_movies_split = list(set(train_matrix.columns) & set(test_matrix.columns))
-
-train_matrix = train_matrix.loc[common_users_split, common_movies_split]
-test_matrix = test_matrix.loc[common_users_split, common_movies_split]
-
-print(f"Train matrix shape: {train_matrix.shape}")
-print(f"Test matrix shape: {test_matrix.shape}")
-
-# Save split data
-train_ratings.to_csv('data/processed/train_ratings.csv', index=False)
-test_ratings.to_csv('data/processed/test_ratings.csv', index=False)
-train_matrix.to_csv('data/processed/train_matrix.csv')
-test_matrix.to_csv('data/processed/test_matrix.csv')
-print("Train/Test split data saved to data/processed/")
-
-print("\n--- Data Pipeline Completed Successfully ---")

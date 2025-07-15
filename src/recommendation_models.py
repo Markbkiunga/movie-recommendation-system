@@ -143,7 +143,8 @@ def content_based_recommendations_genre(user_id, movies_with_features, ratings_c
                      if col not in ['movieId', 'title', 'genres', 'genre_list', 'num_ratings', 'avg_rating', 'rating_std', 'num_users', 'index', 'rec_score']] # Added 'index', 'rec_score' from Streamlit output
     
     # Filter movies_with_features to only include movies that have genre data
-    movies_with_features_genres_only = movies_with_features[genre_columns]
+    # Ensure genre columns are numeric (float) before use
+    movies_with_features_genres_only = movies_with_features[genre_columns].astype(float) # Crucial fix here
 
     # Get genre features for rated movies
     rated_movies_features = movies_with_features[movies_with_features['movieId'].isin(user_movies['movieId'])]
@@ -155,7 +156,8 @@ def content_based_recommendations_genre(user_id, movies_with_features, ratings_c
     for _, movie in rated_movies_features.iterrows():
         movie_rating = user_ratings_dict.get(movie['movieId'], 0) # Use .get() for safety
         if movie_rating > 0: # Only consider movies actually rated by the user
-            movie_genres = movie[genre_columns].values
+            # Ensure movie_genres is numeric before multiplication
+            movie_genres = movie[genre_columns].values.astype(float) # Crucial fix here
             user_profile += movie_rating * movie_genres
     
     # Normalize user profile to avoid bias from users who rated many movies
@@ -165,7 +167,7 @@ def content_based_recommendations_genre(user_id, movies_with_features, ratings_c
         return pd.Series(dtype=float) # User profile is all zeros, cannot recommend
 
     # Calculate similarity with all movies
-    all_movies_features = movies_with_features_genres_only.values
+    all_movies_features = movies_with_features_genres_only.values # This already has float type from above
     movie_scores = np.dot(all_movies_features, user_profile)
     
     # Create recommendations series
@@ -176,6 +178,32 @@ def content_based_recommendations_genre(user_id, movies_with_features, ratings_c
     recommendations = recommendations.drop(rated_movie_ids, errors='ignore')
     
     return recommendations.sort_values(ascending=False)[:n_recommendations]
+
+# Method 2: Movie similarity based on genres (Not used in Streamlit app directly, but good to keep)
+def movie_similarity_recommendations(movie_id, movies_with_features, n_recommendations=10):
+    # Get movie features
+    movie_features = movies_with_features[movies_with_features['movieId'] == movie_id]
+    
+    if len(movie_features) == 0:
+        return pd.Series(dtype=float)
+    
+    # Genre similarity
+    genre_columns = [col for col in movies_with_features.columns 
+                    if col not in ['movieId', 'title', 'genres', 'genre_list', 'num_ratings', 'avg_rating', 'rating_std', 'num_users']]
+    
+    target_movie_genres = movie_features[genre_columns].values.astype(float) # Ensure float
+    all_movies_genres = movies_with_features[genre_columns].values.astype(float) # Ensure float
+    
+    # Calculate cosine similarity
+    similarities = cosine_similarity(target_movie_genres, all_movies_genres)[0]
+    
+    # Create similarity series
+    movie_similarities = pd.Series(similarities, index=movies_with_features['movieId'])
+    
+    # Remove the input movie itself
+    movie_similarities = movie_similarities.drop(movie_id, errors='ignore')
+    
+    return movie_similarities.sort_values(ascending=False)[:n_recommendations]
 
 # --- 4. Hybrid Approach (Content-based + Popularity) ---
 def hybrid_content_recommendations(user_id, movies_with_features, ratings_clean, n_recommendations=10, genre_weight=0.7, popularity_weight=0.3):
