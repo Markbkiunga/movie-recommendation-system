@@ -52,6 +52,8 @@ ratings, movies, user_movie_matrix, movies_with_features = load_data()
 
 st.title("🎬 Movie Recommendation System")
 st.markdown("Get personalized movie recommendations based on your preferences!")
+st.markdown("[View on GitHub](https://github.com/Markbkiunga/movie-recommendation-system)", unsafe_allow_html=True)
+
 
 # --- Sidebar for User Input ---
 st.sidebar.header("Recommendation Settings")
